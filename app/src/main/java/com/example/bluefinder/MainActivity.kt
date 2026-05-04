@@ -1,0 +1,567 @@
+package com.example.bluefinder
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Application
+import android.bluetooth.*
+import android.bluetooth.le.*
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.Build
+import android.os.Bundle
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material3.*
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlin.math.pow
+
+// --- 数据模型 ---
+data class BleDevice(val device: BluetoothDevice, var rssi: Int, val name: String)
+
+// --- ViewModel ---
+@SuppressLint("MissingPermission")
+class BleViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val rawDevicesMap = mutableMapOf<String, BleDevice>()
+    val devices: StateFlow<List<BleDevice>> = MutableStateFlow(emptyList())
+    private var lastSortTime = 0L
+
+    private val _targetDevice = MutableStateFlow<BleDevice?>(null)
+    val targetDevice = _targetDevice.asStateFlow()
+
+    private val _smoothedRssi = MutableStateFlow(-100)
+    val smoothedRssi = _smoothedRssi.asStateFlow()
+
+    //  全局设置状态
+    var attenuationFactor by mutableFloatStateOf(4.5f) // 衰减因子 N
+    var closeThreshold by mutableIntStateOf(-35)       // 十分离近的阈值
+    var showDeviceType by mutableStateOf(false)        // 是否显示蓝牙类型
+
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var bluetoothGatt: BluetoothGatt? = null
+    private var isScanning = false
+    private var lastClassicRestartTime = 0L
+    private val rssiWindow = mutableListOf<Int>()
+    private val WINDOW_SIZE = 5
+
+    fun initBluetooth(adapter: BluetoothAdapter) {
+        bluetoothAdapter = adapter
+    }
+
+    private fun handleFoundDevice(device: BluetoothDevice, rssi: Int) {
+        val rawName = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) device.alias ?: device.name else device.name
+        } catch (e: Exception) { device.name }
+        val name = if (rawName.isNullOrBlank()) "未知设备" else rawName
+
+        if (name == "未知设备" && rssi < -90) return
+
+        val address = device.address
+        rawDevicesMap[address] = BleDevice(device, rssi, name)
+
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastSortTime > 2000) {
+            val sortedList = rawDevicesMap.values.toList().sortedWith(
+                compareByDescending<BleDevice> { it.device.bondState == BluetoothDevice.BOND_BONDED }
+                    .thenByDescending { it.rssi }
+            )
+            (devices as MutableStateFlow).value = sortedList
+            lastSortTime = currentTime
+        }
+
+        if (_targetDevice.value?.device?.address == address) {
+            applyRssiFilter(rssi)
+        }
+    }
+
+    private val leScanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult) {
+            handleFoundDevice(result.device, result.rssi)
+        }
+    }
+
+    private val classicBtReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            when (intent.action) {
+                BluetoothDevice.ACTION_FOUND -> {
+                    val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                    } else { @Suppress("DEPRECATION") intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE) }
+                    val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE).toInt()
+
+                    if (device != null) {
+                        handleFoundDevice(device, rssi)
+                        val target = _targetDevice.value
+                        if (target != null && target.device.address == device.address) {
+                            if (device.type != BluetoothDevice.DEVICE_TYPE_LE) {
+                                bluetoothAdapter?.cancelDiscovery()
+                            }
+                        }
+                    }
+                }
+                BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                    val target = _targetDevice.value
+                    if (target == null) {
+                        if (isScanning) bluetoothAdapter?.startDiscovery()
+                    } else {
+                        if (target.device.type != BluetoothDevice.DEVICE_TYPE_LE) {
+                            viewModelScope.launch {
+                                delay(1000)
+                                if (_targetDevice.value?.device?.type != BluetoothDevice.DEVICE_TYPE_LE) {
+                                    bluetoothAdapter?.startDiscovery()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fun startScan() {
+        if (isScanning) return
+        val scanner = bluetoothAdapter?.bluetoothLeScanner
+        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+        scanner?.startScan(null, settings, leScanCallback)
+
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        getApplication<Application>().registerReceiver(classicBtReceiver, filter)
+        bluetoothAdapter?.startDiscovery()
+        isScanning = true
+    }
+
+    fun stopScan() {
+        isScanning = false
+        bluetoothAdapter?.bluetoothLeScanner?.stopScan(leScanCallback)
+        bluetoothAdapter?.cancelDiscovery()
+        try { getApplication<Application>().unregisterReceiver(classicBtReceiver) } catch (e: Exception) { }
+    }
+
+    fun forceManualRefresh() {
+        viewModelScope.launch {
+            bluetoothAdapter?.cancelDiscovery()
+            delay(300)
+            bluetoothAdapter?.startDiscovery()
+        }
+    }
+
+    fun clearAndRefresh() {
+        rawDevicesMap.clear()
+        (devices as MutableStateFlow).value = emptyList()
+        bluetoothAdapter?.cancelDiscovery()
+        bluetoothAdapter?.startDiscovery()
+    }
+
+    fun selectDevice(device: BleDevice) {
+        _targetDevice.value = device
+        rssiWindow.clear()
+        applyRssiFilter(device.rssi)
+
+        if (device.device.type == BluetoothDevice.DEVICE_TYPE_LE) {
+            bluetoothAdapter?.cancelDiscovery()
+        } else {
+            bluetoothAdapter?.cancelDiscovery()
+        }
+    }
+
+    fun disconnect() {
+        _targetDevice.value = null
+        bluetoothAdapter?.cancelDiscovery()
+        bluetoothAdapter?.startDiscovery()
+    }
+
+    private fun applyRssiFilter(newRssi: Int) {
+        rssiWindow.add(newRssi)
+        if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
+        _smoothedRssi.value = rssiWindow.average().toInt()
+    }
+}
+
+fun calculateDistance(rssi: Int, n: Float): Double {
+    val txPower = -59.0
+    return 10.0.pow((txPower - rssi) / (10.0 * n))
+}
+
+// --- 页面路由枚举 ---
+enum class AppScreen { SCANNER, FINDING, SETTINGS }
+
+// --- MainActivity ---
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+        val requestPermissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { }
+        val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION)
+        } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        requestPermissionLauncher.launch(requiredPermissions)
+
+        setContent {
+            BlueFinderTheme {
+                val viewModel: BleViewModel = viewModel()
+                LaunchedEffect(Unit) {
+                    viewModel.initBluetooth(bluetoothManager.adapter)
+                    viewModel.startScan()
+                }
+
+                val target = viewModel.targetDevice.collectAsState().value
+                var currentScreen by remember { mutableStateOf(AppScreen.SCANNER) }
+
+                LaunchedEffect(target) {
+                    if (target != null) currentScreen = AppScreen.FINDING
+                    else if (currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
+                }
+
+                Crossfade(targetState = currentScreen, label = "ScreenTransition") { screen ->
+                    when (screen) {
+                        AppScreen.SCANNER -> ScannerScreen(viewModel) { currentScreen = AppScreen.SETTINGS }
+                        AppScreen.FINDING -> FindingScreen(viewModel)
+                        AppScreen.SETTINGS -> SettingsScreen(viewModel) { currentScreen = AppScreen.SCANNER }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// --- UI: Scanner ---
+@SuppressLint("MissingPermission")
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+@Composable
+fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
+    val devices by viewModel.devices.collectAsState()
+    var showDialog by remember { mutableStateOf<BleDevice?>(null) }
+    var showUnnamed by remember { mutableStateOf(false) }
+    val context = LocalContext.current
+    val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
+    var isRefreshing by remember { mutableStateOf(false) }
+    val coroutineScope = rememberCoroutineScope()
+    val filteredDevices = if (showUnnamed) devices else devices.filter { it.name != "未知设备" }
+
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Text("BlueFinder", fontSize = 32.sp, fontWeight = FontWeight.Bold, color = Color.White)
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(checked = showUnnamed, onCheckedChange = { showUnnamed = it },
+                    colors = CheckboxDefaults.colors(checkedColor = Color(0xFF0A84FF), uncheckedColor = Color.Gray))
+                Text("未知设备", color = Color.Gray, fontSize = 14.sp)
+                Spacer(modifier = Modifier.width(8.dp))
+                IconButton(onClick = onNavigateToSettings) {
+                    Icon(Icons.Default.Settings, contentDescription = "Settings", tint = Color.White)
+                }
+            }
+        }
+        PullToRefreshBox(isRefreshing = isRefreshing, onRefresh = {
+            isRefreshing = true
+            coroutineScope.launch { viewModel.clearAndRefresh(); delay(1000); isRefreshing = false }
+        }, modifier = Modifier.fillMaxSize()
+        ) {
+            LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                items(items = filteredDevices, key = { it.device.address }) { device ->
+                    DeviceCard(device = device, showType = viewModel.showDeviceType, modifier = Modifier.animateItem()) {
+                        val isConnected = bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+                        if (isConnected || device.device.bondState == BluetoothDevice.BOND_BONDED) {
+                            viewModel.selectDevice(device)
+                        } else {
+                            showDialog = device
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    showDialog?.let { device ->
+        AlertDialog(onDismissRequest = { showDialog = null }, containerColor = Color(0xFF2C2C2E),
+            title = { Text("增强精确定位", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = { Text("连接此设备可获取更高频率的信号反馈。点击建立连接将跳转到设置，请在其中连接该设备。", color = Color.LightGray) },
+            confirmButton = {
+                TextButton(onClick = {
+                    val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+                    context.startActivity(intent)
+                    viewModel.selectDevice(device)
+                    showDialog = null
+                }) { Text("建立连接", color = Color(0xFF0A84FF), fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { viewModel.selectDevice(device); showDialog = null }) {
+                    Text("仅扫描查找", color = Color.Gray)
+                }
+            }
+        )
+    }
+}
+
+@SuppressLint("MissingPermission")
+@Composable
+fun DeviceCard(device: BleDevice, showType: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val isBonded = device.device.bondState == BluetoothDevice.BOND_BONDED
+    val typeStr = when(device.device.type) {
+        BluetoothDevice.DEVICE_TYPE_CLASSIC -> "Classic"
+        BluetoothDevice.DEVICE_TYPE_LE -> "LE"
+        BluetoothDevice.DEVICE_TYPE_DUAL -> "Dual"
+        else -> "Unknown"
+    }
+
+    Box(modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color(0xFF1C1C1E)).clickable(onClick = onClick).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                //  修复名称过长挤爆右侧标签的问题：给 Text 加了 weight(1f, fill=false) 和 TextOverflow.Ellipsis
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = device.name,
+                        color = if (isBonded) Color(0xFFFFD60A) else Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    if (showType) {
+                        Surface(color = Color(0xFF0A84FF).copy(alpha = 0.2f), shape = RoundedCornerShape(4.dp), modifier = Modifier.padding(start = 8.dp)) {
+                            Text(text = typeStr, color = Color(0xFF0A84FF), fontSize = 10.sp, modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp))
+                        }
+                    }
+                }
+                Text(device.device.address, color = Color.Gray, fontSize = 12.sp)
+            }
+            Text("${device.rssi} dBm", color = Color(0xFF0A84FF), fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+        }
+    }
+}
+
+// --- UI: Settings Page ---
+@Composable
+fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+
+    Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
+            Text("设置", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+        }
+
+        // 1. 衰减因子设置
+        Text("衰减因子 (n) - 当前: ${String.format("%.1f", viewModel.attenuationFactor)}", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
+        Text("决定距离预估的敏感度。数值越大，算出的距离越长。", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+
+        //  修复按钮换行问题：减小内边距，缩小一点点字号
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { viewModel.attenuationFactor = 2.0f },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E)),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp)
+            ) {
+                Text("开阔(2.0)", color = if(viewModel.attenuationFactor == 2.0f) Color(0xFF0A84FF) else Color.White, fontSize = 13.sp, maxLines = 1)
+            }
+            Button(
+                onClick = { viewModel.attenuationFactor = 3.5f },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E)),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp)
+            ) {
+                Text("常规(3.5)", color = if(viewModel.attenuationFactor == 3.5f) Color(0xFF0A84FF) else Color.White, fontSize = 13.sp, maxLines = 1)
+            }
+            Button(
+                onClick = { viewModel.attenuationFactor = 4.5f },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E)),
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(horizontal = 2.dp, vertical = 8.dp)
+            ) {
+                Text("复杂(4.5)", color = if(viewModel.attenuationFactor == 4.5f) Color(0xFF0A84FF) else Color.White, fontSize = 13.sp, maxLines = 1)
+            }
+        }
+
+        //  大幅提升 n 值的可调范围 (最高到 20.0)
+        Slider(
+            value = viewModel.attenuationFactor,
+            onValueChange = { viewModel.attenuationFactor = it },
+            valueRange = 1.0f..20.0f,
+            colors = SliderDefaults.colors(thumbColor = Color(0xFF0A84FF), activeTrackColor = Color(0xFF0A84FF))
+        )
+
+        Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
+
+        // 2. 接近阈值设置
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("“十分接近” 触发阈值: ${viewModel.closeThreshold} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
+                Text("大于此信号强度时，屏幕将变绿。靠零越近越难触发。", color = Color.Gray, fontSize = 12.sp)
+            }
+            TextButton(onClick = { viewModel.closeThreshold = -35 }) {
+                Text("恢复默认", color = Color(0xFF0A84FF), fontSize = 14.sp)
+            }
+        }
+
+        Slider(
+            value = viewModel.closeThreshold.toFloat(),
+            onValueChange = { viewModel.closeThreshold = it.toInt() },
+            valueRange = -60f..-20f,
+            steps = 39,
+            colors = SliderDefaults.colors(thumbColor = Color(0xFF34C759), activeTrackColor = Color(0xFF34C759))
+        )
+
+        Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
+
+        // 3. 显示类型开关
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+            Column {
+                Text("显示蓝牙类型", color = Color.White, fontSize = 16.sp)
+                Text("在列表中显示 LE 或 Classic 标签", color = Color.Gray, fontSize = 12.sp)
+            }
+            Switch(
+                checked = viewModel.showDeviceType,
+                onCheckedChange = { viewModel.showDeviceType = it },
+                colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF0A84FF))
+            )
+        }
+
+        Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
+
+        //  4. 关于页面
+        Text("关于", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 12.dp))
+        Text("@苏不拉细 / @subulaxi", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
+        Text("项目地址:https://github.com/Subulaxi/BlueFinder", color = Color.Gray, fontSize = 14.sp)
+    }
+}
+
+// --- UI: Finding Page ---
+@Composable
+fun FindingScreen(viewModel: BleViewModel) {
+    BackHandler { viewModel.disconnect() }
+    val rssi by viewModel.smoothedRssi.collectAsState()
+    val device = viewModel.targetDevice.collectAsState().value
+    val context = LocalContext.current
+
+    val isVeryClose = rssi > viewModel.closeThreshold
+    val distance = calculateDistance(rssi, viewModel.attenuationFactor)
+
+    val bgColor by animateColorAsState(
+        targetValue = if (isVeryClose) Color(0xFF34C759) else Color(0xFF121212),
+        animationSpec = tween(durationMillis = 800, easing = LinearOutSlowInEasing), label = "bg_color"
+    )
+
+    LaunchedEffect(rssi) {
+        val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+        if (rssi > -60) {
+            val delayTime = maxOf(50L, (100L + (rssi * 2L)))
+            vibrator.vibrate(VibrationEffect.createOneShot(20, VibrationEffect.DEFAULT_AMPLITUDE))
+            delay(delayTime)
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(bgColor)) {
+
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(top = 40.dp, start = 16.dp, end = 16.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(onClick = { viewModel.disconnect() }) {
+                Text("← 返回", color = Color.White, fontSize = 18.sp)
+            }
+            IconButton(onClick = { viewModel.forceManualRefresh() }) {
+                Icon(Icons.Default.Refresh, contentDescription = "刷新信号", tint = Color.White)
+            }
+        }
+
+        val infiniteTransition = rememberInfiniteTransition(label = "particles")
+        val scale by infiniteTransition.animateFloat(
+            initialValue = 0f,
+            targetValue = 2.5f,
+            animationSpec = infiniteRepeatable(animation = tween(2000, easing = LinearOutSlowInEasing), repeatMode = RepeatMode.Restart),
+            label = "particle_scale"
+        )
+
+        val alpha by infiniteTransition.animateFloat(
+            initialValue = 0.6f,
+            targetValue = 0.0f,
+            animationSpec = infiniteRepeatable(animation = tween(2000, easing = LinearOutSlowInEasing), repeatMode = RepeatMode.Restart),
+            label = "particle_alpha"
+        )
+
+        if (!isVeryClose) {
+            Canvas(modifier = Modifier.fillMaxSize()) {
+                val currentRadius = (size.minDimension / 4) * scale
+                val glowBrush = Brush.radialGradient(
+                    colors = listOf(
+                        Color.White.copy(alpha = alpha),
+                        Color.Transparent
+                    ),
+                    center = center,
+                    radius = currentRadius.coerceAtLeast(1f)
+                )
+                drawCircle(brush = glowBrush, radius = currentRadius, center = center)
+            }
+        }
+
+        Column(modifier = Modifier.align(Alignment.Center), horizontalAlignment = Alignment.CenterHorizontally) {
+            AnimatedContent(targetState = isVeryClose, transitionSpec = { fadeIn(tween(500)) togetherWith fadeOut(tween(500)) }, label = "TextTransition") { close ->
+                if (close) {
+                    Text("十分接近", color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
+                } else {
+                    //   dBm 单位
+                    Row(verticalAlignment = Alignment.Bottom) {
+                        Text("$rssi", color = Color.White, fontSize = 80.sp, fontWeight = FontWeight.Light)
+                        Text("dBm", color = Color.White.copy(alpha = 0.5f), fontSize = 24.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(bottom = 16.dp, start = 8.dp))
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            val subText = if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
+            Text(text = subText, color = Color.White.copy(alpha = 0.7f), fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.animateContentSize())
+        }
+        Text(text = "正在寻找: ${device?.name}", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp))
+    }
+}
+
+@Composable
+fun BlueFinderTheme(content: @Composable () -> Unit) {
+    MaterialTheme(colorScheme = darkColorScheme(background = Color(0xFF121212), surface = Color(0xFF1C1C1E)), content = content)
+}
