@@ -16,6 +16,7 @@ import android.os.Vibrator
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
@@ -39,7 +40,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -72,20 +72,32 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     private val _smoothedRssi = MutableStateFlow(-100)
     val smoothedRssi = _smoothedRssi.asStateFlow()
 
-    //  全局设置状态
-    var attenuationFactor by mutableFloatStateOf(4.5f) // 衰减因子 N
-    var closeThreshold by mutableIntStateOf(-35)       // 十分离近的阈值
-    var showDeviceType by mutableStateOf(false)        // 是否显示蓝牙类型
+    var attenuationFactor by mutableFloatStateOf(4.5f)
+    var closeThreshold by mutableIntStateOf(-35)
+    var showDeviceType by mutableStateOf(false)
 
     private var bluetoothAdapter: BluetoothAdapter? = null
-    private var bluetoothGatt: BluetoothGatt? = null
     private var isScanning = false
-    private var lastClassicRestartTime = 0L
     private val rssiWindow = mutableListOf<Int>()
     private val WINDOW_SIZE = 5
 
     fun initBluetooth(adapter: BluetoothAdapter) {
         bluetoothAdapter = adapter
+    }
+
+    // 🔥 新增：利用 Java 反射黑科技，强制一键取消配对！
+    fun unpairDevice(device: BluetoothDevice) {
+        try {
+            val method = device.javaClass.getMethod("removeBond")
+            method.invoke(device)
+            // 解绑后稍微延迟，重新刷新列表
+            viewModelScope.launch {
+                delay(1000)
+                clearAndRefresh()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
     }
 
     private fun handleFoundDevice(device: BluetoothDevice, rssi: Int) {
@@ -242,9 +254,22 @@ class MainActivity : ComponentActivity() {
         setContent {
             BlueFinderTheme {
                 val viewModel: BleViewModel = viewModel()
+
+                // 🔥 新增：蓝牙开启状态检查与系统一键开启弹窗回调
+                val enableBtLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+                    if (result.resultCode == android.app.Activity.RESULT_OK) {
+                        viewModel.startScan() // 用户点击允许后，立刻开始扫描
+                    }
+                }
+
                 LaunchedEffect(Unit) {
                     viewModel.initBluetooth(bluetoothManager.adapter)
-                    viewModel.startScan()
+                    // 如果蓝牙没开，直接弹出系统底层的“一键开启蓝牙”对话框
+                    if (bluetoothManager.adapter != null && !bluetoothManager.adapter.isEnabled) {
+                        enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
+                    } else {
+                        viewModel.startScan()
+                    }
                 }
 
                 val target = viewModel.targetDevice.collectAsState().value
@@ -304,11 +329,13 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
             LazyColumn(modifier = Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 items(items = filteredDevices, key = { it.device.address }) { device ->
                     DeviceCard(device = device, showType = viewModel.showDeviceType, modifier = Modifier.animateItem()) {
-                        val isConnected = bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
-                        if (isConnected || device.device.bondState == BluetoothDevice.BOND_BONDED) {
-                            viewModel.selectDevice(device)
-                        } else {
+                        val isBonded = device.device.bondState == BluetoothDevice.BOND_BONDED
+                        val isGattConnected = bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+
+                        if (isBonded || isGattConnected) {
                             showDialog = device
+                        } else {
+                            viewModel.selectDevice(device)
                         }
                     }
                 }
@@ -316,22 +343,23 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
         }
     }
 
+    // 🔥 全新的智能拦截与解绑弹窗
     showDialog?.let { device ->
         AlertDialog(onDismissRequest = { showDialog = null }, containerColor = Color(0xFF2C2C2E),
-            title = { Text("增强精确定位", color = Color.White, fontWeight = FontWeight.Bold) },
-            text = { Text("连接此设备可获取更高频率的信号反馈。点击建立连接将跳转到设置，请在其中连接该设备。", color = Color.LightGray) },
+            title = { Text("⚠️ 查找已配对设备", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = { Text("如果设备正与手机保持连接，它将停止发送广播，导致雷达卡死。\n\n如需强制测距，您可以选择【一键取消配对】强行逼迫设备发出广播；如果您已确认它处于断开状态，请点击【直接查找】。", color = Color.LightGray) },
             confirmButton = {
                 TextButton(onClick = {
-                    val intent = Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
-                    context.startActivity(intent)
                     viewModel.selectDevice(device)
                     showDialog = null
-                }) { Text("建立连接", color = Color(0xFF0A84FF), fontWeight = FontWeight.Bold) }
+                }) { Text("🎯 直接查找", color = Color(0xFF0A84FF), fontWeight = FontWeight.Bold) }
             },
             dismissButton = {
-                TextButton(onClick = { viewModel.selectDevice(device); showDialog = null }) {
-                    Text("仅扫描查找", color = Color.Gray)
-                }
+                TextButton(onClick = {
+                    // 🔥 黑科技：调用反序列化一键解绑，无需跳转设置！
+                    viewModel.unpairDevice(device.device)
+                    showDialog = null
+                }) { Text("💥 一键取消配对", color = Color(0xFFFF453A)) }
             }
         )
     }
@@ -351,7 +379,6 @@ fun DeviceCard(device: BleDevice, showType: Boolean, modifier: Modifier = Modifi
     Box(modifier = modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(Color(0xFF1C1C1E)).clickable(onClick = onClick).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                //  修复名称过长挤爆右侧标签的问题：给 Text 加了 weight(1f, fill=false) 和 TextOverflow.Ellipsis
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                     Text(
                         text = device.name,
@@ -386,11 +413,9 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             Text("设置", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
         }
 
-        // 1. 衰减因子设置
         Text("衰减因子 (n) - 当前: ${String.format("%.1f", viewModel.attenuationFactor)}", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
         Text("决定距离预估的敏感度。数值越大，算出的距离越长。", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
 
-        //  修复按钮换行问题：减小内边距，缩小一点点字号
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = { viewModel.attenuationFactor = 2.0f },
@@ -418,7 +443,6 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             }
         }
 
-        //  大幅提升 n 值的可调范围 (最高到 20.0)
         Slider(
             value = viewModel.attenuationFactor,
             onValueChange = { viewModel.attenuationFactor = it },
@@ -428,7 +452,6 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
 
-        // 2. 接近阈值设置
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("“十分接近” 触发阈值: ${viewModel.closeThreshold} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
@@ -449,7 +472,6 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
 
-        // 3. 显示类型开关
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Column {
                 Text("显示蓝牙类型", color = Color.White, fontSize = 16.sp)
@@ -464,7 +486,6 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
 
-        //  4. 关于页面
         Text("关于", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 12.dp))
         Text("@苏不拉细 / @subulaxi", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
         Text("项目地址:https://github.com/Subulaxi/BlueFinder", color = Color.Gray, fontSize = 14.sp)
@@ -546,7 +567,6 @@ fun FindingScreen(viewModel: BleViewModel) {
                 if (close) {
                     Text("十分接近", color = Color.White, fontSize = 48.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
                 } else {
-                    //   dBm 单位
                     Row(verticalAlignment = Alignment.Bottom) {
                         Text("$rssi", color = Color.White, fontSize = 80.sp, fontWeight = FontWeight.Light)
                         Text("dBm", color = Color.White.copy(alpha = 0.5f), fontSize = 24.sp, fontWeight = FontWeight.Medium, modifier = Modifier.padding(bottom = 16.dp, start = 8.dp))
