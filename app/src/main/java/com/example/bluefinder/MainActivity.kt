@@ -99,9 +99,6 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var isScanning = false
-    private val rssiWindow = mutableListOf<Int>()
-    private val WINDOW_SIZE = 5
-    private val rssiSecondBuffer = mutableListOf<Int>()
     private var latestRssi: Int? = null
     private val deviceLastSeenMap = mutableMapOf<String, Long>()
     private var targetLastSeenAt: Long = 0L
@@ -252,7 +249,6 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     fun selectDevice(device: BleDevice) {
         _targetDevice.value = device
         targetLastSeenAt = System.currentTimeMillis()
-        rssiWindow.clear()
         applyRssiFilter(device.rssi)
 
         if (device.device.type == BluetoothDevice.DEVICE_TYPE_LE) {
@@ -293,20 +289,14 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun applyRssiFilter(newRssi: Int) {
-        rssiSecondBuffer.add(newRssi)
+        _smoothedRssi.value = newRssi
     }
 
     private fun startRssiRefreshLoop() {
         viewModelScope.launch {
             while (true) {
                 delay(1000)
-                if (rssiSecondBuffer.isNotEmpty()) {
-                    val secondTrimmed = trimmedAverage(rssiSecondBuffer).toInt()
-                    rssiSecondBuffer.clear()
-                    rssiWindow.add(secondTrimmed)
-                    if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
-                    _smoothedRssi.value = rssiWindow.average().toInt()
-                } else if (_targetDevice.value != null) {
+                if (_targetDevice.value != null && (System.currentTimeMillis() - targetLastSeenAt) > 1000) {
                     targetMissedReadCount++
                 }
             }
