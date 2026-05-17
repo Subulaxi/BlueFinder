@@ -53,14 +53,25 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.pow
 
 // --- 数据模型 ---
 data class BleDevice(val device: BluetoothDevice, var rssi: Int, val name: String)
+data class CalibrationPoint(val distanceMeter: Float, val samples: List<Int>, val averageRssi: Float)
+data class CalibrationProfile(
+    val id: Long,
+    val name: String,
+    val attenuationFactor: Float,
+    val txPowerAtOneMeter: Float,
+    val points: List<CalibrationPoint>
+)
 
 // --- ViewModel ---
 @SuppressLint("MissingPermission")
 class BleViewModel(application: Application) : AndroidViewModel(application) {
+    private val prefs = application.getSharedPreferences("calibration_profiles", Context.MODE_PRIVATE)
 
     private val rawDevicesMap = mutableMapOf<String, BleDevice>()
     val devices: StateFlow<List<BleDevice>> = MutableStateFlow(emptyList())
@@ -73,13 +84,25 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     val smoothedRssi = _smoothedRssi.asStateFlow()
 
     var attenuationFactor by mutableFloatStateOf(4.5f)
+    var txPowerAtOneMeter by mutableFloatStateOf(-59f)
     var closeThreshold by mutableIntStateOf(-35)
     var showDeviceType by mutableStateOf(false)
+    var calibrationProfiles by mutableStateOf(emptyList<CalibrationProfile>())
+    var selectedCalibrationId by mutableStateOf<Long?>(null)
+    var calibrationDistances by mutableStateOf(listOf(1f, 2f, 3f))
+    var calibrationSamplesPerPoint by mutableIntStateOf(8)
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var isScanning = false
     private val rssiWindow = mutableListOf<Int>()
     private val WINDOW_SIZE = 5
+    private var latestRssi: Int? = null
+    private val _isCalibrating = MutableStateFlow(false)
+    val isCalibrating = _isCalibrating.asStateFlow()
+
+    init {
+        loadCalibrationProfiles()
+    }
 
     fun initBluetooth(adapter: BluetoothAdapter) {
         bluetoothAdapter = adapter
@@ -101,6 +124,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleFoundDevice(device: BluetoothDevice, rssi: Int) {
+        latestRssi = rssi
         val rawName = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) device.alias ?: device.name else device.name
         } catch (e: Exception) { device.name }
@@ -230,15 +254,124 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
         _smoothedRssi.value = rssiWindow.average().toInt()
     }
+
+    suspend fun collectSamplesForDistance(distanceMeter: Float, sampleCount: Int): CalibrationPoint {
+        _isCalibrating.value = true
+        val values = mutableListOf<Int>()
+        repeat(sampleCount) {
+            delay(350)
+            latestRssi?.let(values::add)
+        }
+        _isCalibrating.value = false
+        val cleaned = trimExtremes(values)
+        val avg = if (cleaned.isEmpty()) -100f else cleaned.average().toFloat()
+        return CalibrationPoint(distanceMeter, values, avg)
+    }
+
+    private fun trimExtremes(values: List<Int>): List<Int> {
+        if (values.size < 3) return values
+        val sorted = values.sorted()
+        return sorted.subList(1, sorted.size - 1)
+    }
+
+    fun buildProfileFromPoints(name: String, points: List<CalibrationPoint>): CalibrationProfile {
+        val regression = fitPathLoss(points)
+        return CalibrationProfile(
+            id = System.currentTimeMillis(),
+            name = name,
+            attenuationFactor = regression.second,
+            txPowerAtOneMeter = regression.first,
+            points = points
+        )
+    }
+
+    private fun fitPathLoss(points: List<CalibrationPoint>): Pair<Float, Float> {
+        val xs = points.map { kotlin.math.log10(it.distanceMeter.toDouble()) }
+        val ys = points.map { it.averageRssi.toDouble() }
+        val xMean = xs.average()
+        val yMean = ys.average()
+        var num = 0.0
+        var den = 0.0
+        xs.indices.forEach { i ->
+            num += (xs[i] - xMean) * (ys[i] - yMean)
+            den += (xs[i] - xMean) * (xs[i] - xMean)
+        }
+        val slope = if (den == 0.0) -40.0 else num / den
+        val intercept = yMean - slope * xMean
+        val n = (-slope / 10.0).coerceIn(1.0, 20.0)
+        return intercept.toFloat() to n.toFloat()
+    }
+
+    fun saveCalibrationProfile(profile: CalibrationProfile) {
+        calibrationProfiles = listOf(profile) + calibrationProfiles
+        persistCalibrationProfiles()
+    }
+
+    fun applyCalibration(profile: CalibrationProfile) {
+        attenuationFactor = profile.attenuationFactor
+        txPowerAtOneMeter = profile.txPowerAtOneMeter
+        selectedCalibrationId = profile.id
+    }
+
+    private fun loadCalibrationProfiles() {
+        val raw = prefs.getString("profiles_json", "[]") ?: "[]"
+        val arr = JSONArray(raw)
+        val loaded = mutableListOf<CalibrationProfile>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val pointsArray = obj.getJSONArray("points")
+            val points = mutableListOf<CalibrationPoint>()
+            for (j in 0 until pointsArray.length()) {
+                val p = pointsArray.getJSONObject(j)
+                val samplesArray = p.getJSONArray("samples")
+                val samples = mutableListOf<Int>()
+                for (k in 0 until samplesArray.length()) samples.add(samplesArray.getInt(k))
+                points.add(CalibrationPoint(p.getDouble("distance").toFloat(), samples, p.getDouble("avg").toFloat()))
+            }
+            loaded.add(
+                CalibrationProfile(
+                    id = obj.getLong("id"),
+                    name = obj.getString("name"),
+                    attenuationFactor = obj.getDouble("n").toFloat(),
+                    txPowerAtOneMeter = obj.getDouble("tx").toFloat(),
+                    points = points
+                )
+            )
+        }
+        calibrationProfiles = loaded
+    }
+
+    private fun persistCalibrationProfiles() {
+        val arr = JSONArray()
+        calibrationProfiles.forEach { profile ->
+            val points = JSONArray()
+            profile.points.forEach { point ->
+                points.put(
+                    JSONObject()
+                        .put("distance", point.distanceMeter)
+                        .put("avg", point.averageRssi)
+                        .put("samples", JSONArray(point.samples))
+                )
+            }
+            arr.put(
+                JSONObject()
+                    .put("id", profile.id)
+                    .put("name", profile.name)
+                    .put("n", profile.attenuationFactor)
+                    .put("tx", profile.txPowerAtOneMeter)
+                    .put("points", points)
+            )
+        }
+        prefs.edit().putString("profiles_json", arr.toString()).apply()
+    }
 }
 
-fun calculateDistance(rssi: Int, n: Float): Double {
-    val txPower = -59.0
-    return 10.0.pow((txPower - rssi) / (10.0 * n))
+fun calculateDistance(rssi: Int, n: Float, txPowerAtOneMeter: Float): Double {
+    return 10.0.pow((txPowerAtOneMeter - rssi) / (10.0 * n))
 }
 
 // --- 页面路由枚举 ---
-enum class AppScreen { SCANNER, FINDING, SETTINGS }
+enum class AppScreen { SCANNER, FINDING, SETTINGS, CALIBRATION_LIST, CALIBRATION_RUN }
 
 // --- MainActivity ---
 class MainActivity : ComponentActivity() {
@@ -284,7 +417,20 @@ class MainActivity : ComponentActivity() {
                     when (screen) {
                         AppScreen.SCANNER -> ScannerScreen(viewModel) { currentScreen = AppScreen.SETTINGS }
                         AppScreen.FINDING -> FindingScreen(viewModel)
-                        AppScreen.SETTINGS -> SettingsScreen(viewModel) { currentScreen = AppScreen.SCANNER }
+                        AppScreen.SETTINGS -> SettingsScreen(
+                            viewModel,
+                            onBack = { currentScreen = AppScreen.SCANNER },
+                            onOpenCalibration = { currentScreen = AppScreen.CALIBRATION_LIST }
+                        )
+                        AppScreen.CALIBRATION_LIST -> CalibrationListScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = AppScreen.SETTINGS },
+                            onNewCalibration = { currentScreen = AppScreen.CALIBRATION_RUN }
+                        )
+                        AppScreen.CALIBRATION_RUN -> CalibrationRunScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = AppScreen.CALIBRATION_LIST }
+                        )
                     }
                 }
             }
@@ -402,9 +548,78 @@ fun DeviceCard(device: BleDevice, showType: Boolean, modifier: Modifier = Modifi
     }
 }
 
+@Composable
+fun CalibrationListScreen(viewModel: BleViewModel, onBack: () -> Unit, onNewCalibration: () -> Unit) {
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
+            Text("校准管理", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+        }
+        Button(onClick = onNewCalibration, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) {
+            Text("进行新校准")
+        }
+        Spacer(Modifier.height(16.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(viewModel.calibrationProfiles, key = { it.id }) { profile ->
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E))
+                        .clickable { viewModel.applyCalibration(profile) }.padding(14.dp)
+                ) {
+                    Column {
+                        Text(profile.name, color = Color.White, fontWeight = FontWeight.Medium)
+                        Text("n=${"%.2f".format(profile.attenuationFactor)} / Tx=${profile.txPowerAtOneMeter.toInt()} dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+    val scope = rememberCoroutineScope()
+    val device = viewModel.targetDevice.collectAsState().value
+    var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
+    var running by remember { mutableStateOf(false) }
+    var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
+    val isCalibrating by viewModel.isCalibrating.collectAsState()
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
+            Text("校准", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+        }
+        Text("请先在主页面选择要追踪的设备，然后按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
+        Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
+        OutlinedTextField(value = profileName, onValueChange = { profileName = it }, label = { Text("校准名称") }, modifier = Modifier.fillMaxWidth())
+        Spacer(Modifier.height(12.dp))
+        Button(enabled = !running && device != null, onClick = {
+            running = true
+            points = emptyList()
+            scope.launch {
+                val collected = mutableListOf<CalibrationPoint>()
+                for (d in viewModel.calibrationDistances) collected += viewModel.collectSamplesForDistance(d, viewModel.calibrationSamplesPerPoint)
+                points = collected
+                val profile = viewModel.buildProfileFromPoints(profileName, points)
+                viewModel.saveCalibrationProfile(profile)
+                viewModel.applyCalibration(profile)
+                running = false
+            }
+        }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) {
+            Text(if (running || isCalibrating) "校准中..." else "开始采样并拟合")
+        }
+        Spacer(Modifier.height(14.dp))
+        points.forEach { p ->
+            Text("${p.distanceMeter.toInt()}m: 原始${p.samples} -> 均值 ${"%.1f".format(p.averageRssi)} dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+        }
+    }
+}
+
 // --- UI: Settings Page ---
 @Composable
-fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
+fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibration: () -> Unit) {
     BackHandler(onBack = onBack)
 
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
@@ -449,6 +664,20 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             valueRange = 1.0f..20.0f,
             colors = SliderDefaults.colors(thumbColor = Color(0xFF0A84FF), activeTrackColor = Color(0xFF0A84FF))
         )
+        Text("1米强度基准值 (Tx @1m): ${viewModel.txPowerAtOneMeter.toInt()} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 8.dp))
+        Slider(
+            value = viewModel.txPowerAtOneMeter,
+            onValueChange = { viewModel.txPowerAtOneMeter = it },
+            valueRange = -90f..-20f,
+            colors = SliderDefaults.colors(thumbColor = Color(0xFF64D2FF), activeTrackColor = Color(0xFF64D2FF))
+        )
+        Button(
+            onClick = onOpenCalibration,
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E))
+        ) {
+            Text("进入校准", color = Color.White)
+        }
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
 
@@ -501,7 +730,7 @@ fun FindingScreen(viewModel: BleViewModel) {
     val context = LocalContext.current
 
     val isVeryClose = rssi > viewModel.closeThreshold
-    val distance = calculateDistance(rssi, viewModel.attenuationFactor)
+    val distance = calculateDistance(rssi, viewModel.attenuationFactor, viewModel.txPowerAtOneMeter)
 
     val bgColor by animateColorAsState(
         targetValue = if (isVeryClose) Color(0xFF34C759) else Color(0xFF121212),
