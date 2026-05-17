@@ -30,6 +30,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -41,6 +42,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -97,6 +99,8 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     private val rssiWindow = mutableListOf<Int>()
     private val WINDOW_SIZE = 5
     private var latestRssi: Int? = null
+    private val deviceLastSeenMap = mutableMapOf<String, Long>()
+    private var targetLastSeenAt: Long = 0L
     private val _isCalibrating = MutableStateFlow(false)
     val isCalibrating = _isCalibrating.asStateFlow()
 
@@ -106,6 +110,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun initBluetooth(adapter: BluetoothAdapter) {
         bluetoothAdapter = adapter
+        startPruneLoop()
     }
 
     // 🔥 新增：利用 Java 反射黑科技，强制一键取消配对！
@@ -134,6 +139,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
         val address = device.address
         rawDevicesMap[address] = BleDevice(device, rssi, name)
+        deviceLastSeenMap[address] = System.currentTimeMillis()
 
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastSortTime > 2000) {
@@ -146,6 +152,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (_targetDevice.value?.device?.address == address) {
+            targetLastSeenAt = System.currentTimeMillis()
             applyRssiFilter(rssi)
         }
     }
@@ -233,6 +240,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectDevice(device: BleDevice) {
         _targetDevice.value = device
+        targetLastSeenAt = System.currentTimeMillis()
         rssiWindow.clear()
         applyRssiFilter(device.rssi)
 
@@ -247,6 +255,29 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         _targetDevice.value = null
         bluetoothAdapter?.cancelDiscovery()
         bluetoothAdapter?.startDiscovery()
+    }
+
+    fun isTargetSignalTimedOut(timeoutMs: Long = 4500L): Boolean {
+        val target = _targetDevice.value ?: return false
+        if (!rawDevicesMap.containsKey(target.device.address)) return true
+        return System.currentTimeMillis() - targetLastSeenAt > timeoutMs
+    }
+
+    private fun startPruneLoop() {
+        viewModelScope.launch {
+            while (true) {
+                delay(2000)
+                val now = System.currentTimeMillis()
+                val staleAddresses = deviceLastSeenMap.filterValues { now - it > 7000 }.keys
+                if (staleAddresses.isNotEmpty()) {
+                    staleAddresses.forEach {
+                        rawDevicesMap.remove(it)
+                        deviceLastSeenMap.remove(it)
+                    }
+                    (devices as MutableStateFlow).value = rawDevicesMap.values.toList().sortedByDescending { it.rssi }
+                }
+            }
+        }
     }
 
     private fun applyRssiFilter(newRssi: Int) {
@@ -549,12 +580,20 @@ fun DeviceCard(device: BleDevice, showType: Boolean, modifier: Modifier = Modifi
 }
 
 @Composable
+fun BackTitleButton(title: String, onBack: () -> Unit) {
+    TextButton(onClick = onBack) {
+        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
+        Spacer(Modifier.width(6.dp))
+        Text(title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
 fun CalibrationListScreen(viewModel: BleViewModel, onBack: () -> Unit, onNewCalibration: () -> Unit) {
     BackHandler(onBack = onBack)
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
-            Text("校准管理", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+            BackTitleButton("校准管理", onBack)
         }
         Button(onClick = onNewCalibration, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) {
             Text("进行新校准")
@@ -573,6 +612,9 @@ fun CalibrationListScreen(viewModel: BleViewModel, onBack: () -> Unit, onNewCali
                 }
             }
         }
+        if (viewModel.calibrationProfiles.isEmpty()) {
+            Text("当前没有历史校准", color = Color.Gray, modifier = Modifier.padding(top = 20.dp))
+        }
     }
 }
 
@@ -587,11 +629,13 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     val isCalibrating by viewModel.isCalibrating.collectAsState()
 
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
-        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
-            Text("校准", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) { BackTitleButton("自动校准", onBack) }
+        Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
+        LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(viewModel.devices.collectAsState().value, key = { it.device.address }) { d ->
+                DeviceCard(device = d, showType = false) { viewModel.selectDevice(d) }
+            }
         }
-        Text("请先在主页面选择要追踪的设备，然后按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
         Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
         OutlinedTextField(value = profileName, onValueChange = { profileName = it }, label = { Text("校准名称") }, modifier = Modifier.fillMaxWidth())
         Spacer(Modifier.height(12.dp))
@@ -624,8 +668,7 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibratio
 
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
-            Text("设置", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+            BackTitleButton("设置", onBack)
         }
 
         Text("衰减因子 (n) - 当前: ${String.format("%.1f", viewModel.attenuationFactor)}", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
@@ -676,7 +719,7 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibratio
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E))
         ) {
-            Text("进入校准", color = Color.White)
+            Text("进入自动校准", color = Color.White)
         }
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
@@ -717,7 +760,13 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibratio
 
         Text("关于", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 12.dp))
         Text("@苏不拉细 / @subulaxi", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
-        Text("项目地址:https://github.com/Subulaxi/BlueFinder", color = Color.Gray, fontSize = 14.sp)
+        val uriHandler = LocalUriHandler.current
+        Text(
+            "项目地址: https://github.com/Subulaxi/BlueFinder",
+            color = Color(0xFF0A84FF),
+            fontSize = 14.sp,
+            modifier = Modifier.clickable { uriHandler.openUri("https://github.com/Subulaxi/BlueFinder") }
+        )
     }
 }
 
@@ -731,6 +780,7 @@ fun FindingScreen(viewModel: BleViewModel) {
 
     val isVeryClose = rssi > viewModel.closeThreshold
     val distance = calculateDistance(rssi, viewModel.attenuationFactor, viewModel.txPowerAtOneMeter)
+    val isSignalTimeout = viewModel.isTargetSignalTimedOut()
 
     val bgColor by animateColorAsState(
         targetValue = if (isVeryClose) Color(0xFF34C759) else Color(0xFF121212),
@@ -803,7 +853,7 @@ fun FindingScreen(viewModel: BleViewModel) {
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
-            val subText = if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
+            val subText = if (isSignalTimeout) "连接超时：未读取到最新信号" else if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
             Text(text = subText, color = Color.White.copy(alpha = 0.7f), fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.animateContentSize())
         }
         Text(text = "正在寻找: ${device?.name}", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp))
