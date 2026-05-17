@@ -102,7 +102,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     private var latestRssi: Int? = null
     private val deviceLastSeenMap = mutableMapOf<String, Long>()
     private var targetLastSeenAt: Long = 0L
-    private var targetMissedReadCount: Int = 0
+    private var targetMissedReadCount by mutableIntStateOf(0)
     private val _isCalibrating = MutableStateFlow(false)
     val isCalibrating = _isCalibrating.asStateFlow()
 
@@ -265,10 +265,10 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         bluetoothAdapter?.startDiscovery()
     }
 
-    fun isTargetSignalTimedOut(timeoutMs: Long = 4500L): Boolean {
+    fun isTargetSignalTimedOut(): Boolean {
         val target = _targetDevice.value ?: return false
         if (!rawDevicesMap.containsKey(target.device.address)) return true
-        return targetMissedReadCount >= 3 || (System.currentTimeMillis() - targetLastSeenAt > timeoutMs)
+        return targetMissedReadCount >= 3
     }
 
     private fun startPruneLoop() {
