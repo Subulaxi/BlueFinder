@@ -377,36 +377,31 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     fun readCurrentRssi(): Int? = latestRssi
 
     private fun loadCalibrationProfiles() {
-        try {
-            val raw = prefs.getString("profiles_json", "[]") ?: "[]"
-            val arr = JSONArray(raw)
-            val loaded = mutableListOf<CalibrationProfile>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val pointsArray = obj.optJSONArray("points") ?: JSONArray()
-                val points = mutableListOf<CalibrationPoint>()
-                for (j in 0 until pointsArray.length()) {
-                    val p = pointsArray.getJSONObject(j)
-                    val samplesArray = p.optJSONArray("samples") ?: JSONArray()
-                    val samples = mutableListOf<Int>()
-                    for (k in 0 until samplesArray.length()) samples.add(samplesArray.getInt(k))
-                    points.add(CalibrationPoint(p.optDouble("distance", 1.0).toFloat(), samples, p.optDouble("avg", -100.0).toFloat()))
-                }
-                loaded.add(
-                    CalibrationProfile(
-                        id = obj.optLong("id", System.currentTimeMillis()),
-                        name = obj.optString("name", "未命名校准"),
-                        attenuationFactor = obj.optDouble("n", 4.5).toFloat(),
-                        txPowerAtOneMeter = obj.optDouble("tx", -59.0).toFloat(),
-                        points = points
-                    )
-                )
+        val raw = prefs.getString("profiles_json", "[]") ?: "[]"
+        val arr = JSONArray(raw)
+        val loaded = mutableListOf<CalibrationProfile>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val pointsArray = obj.getJSONArray("points")
+            val points = mutableListOf<CalibrationPoint>()
+            for (j in 0 until pointsArray.length()) {
+                val p = pointsArray.getJSONObject(j)
+                val samplesArray = p.getJSONArray("samples")
+                val samples = mutableListOf<Int>()
+                for (k in 0 until samplesArray.length()) samples.add(samplesArray.getInt(k))
+                points.add(CalibrationPoint(p.getDouble("distance").toFloat(), samples, p.getDouble("avg").toFloat()))
             }
-            calibrationProfiles = loaded
-        } catch (_: Exception) {
-            calibrationProfiles = emptyList()
-            prefs.edit().putString("profiles_json", "[]").apply()
+            loaded.add(
+                CalibrationProfile(
+                    id = obj.getLong("id"),
+                    name = obj.getString("name"),
+                    attenuationFactor = obj.getDouble("n").toFloat(),
+                    txPowerAtOneMeter = obj.getDouble("tx").toFloat(),
+                    points = points
+                )
+            )
         }
+        calibrationProfiles = loaded
     }
 
     private fun persistCalibrationProfiles() {
