@@ -99,6 +99,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     private var isScanning = false
     private val rssiWindow = mutableListOf<Int>()
     private val WINDOW_SIZE = 5
+    private val rssiSecondBuffer = mutableListOf<Int>()
     private var latestRssi: Int? = null
     private val deviceLastSeenMap = mutableMapOf<String, Long>()
     private var targetLastSeenAt: Long = 0L
@@ -107,6 +108,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         loadCalibrationProfiles()
+        startRssiRefreshLoop()
     }
 
     fun initBluetooth(adapter: BluetoothAdapter) {
@@ -282,9 +284,22 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun applyRssiFilter(newRssi: Int) {
-        rssiWindow.add(newRssi)
-        if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
-        _smoothedRssi.value = rssiWindow.average().toInt()
+        rssiSecondBuffer.add(newRssi)
+    }
+
+    private fun startRssiRefreshLoop() {
+        viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                if (rssiSecondBuffer.isNotEmpty()) {
+                    val secondTrimmed = trimmedAverage(rssiSecondBuffer).toInt()
+                    rssiSecondBuffer.clear()
+                    rssiWindow.add(secondTrimmed)
+                    if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
+                    _smoothedRssi.value = trimmedAverage(rssiWindow).toInt()
+                }
+            }
+        }
     }
 
     suspend fun collectSamplesForDistance(distanceMeter: Float, sampleCount: Int): CalibrationPoint {
