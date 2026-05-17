@@ -864,7 +864,7 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibratio
             colors = SliderDefaults.colors(thumbColor = Color(0xFF0A84FF), activeTrackColor = Color(0xFF0A84FF))
         )
         Text("1米强度基准值 (Tx @1m): ${viewModel.txPowerAtOneMeter.toInt()} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
-        Text("推荐值：-10 dBm。该值用于1米处信号基准，影响测距结果。", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
+        Text("推荐值：-50 dBm。该值用于1米处信号基准，影响测距结果。", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
         Slider(
             value = viewModel.txPowerAtOneMeter,
             onValueChange = { viewModel.txPowerAtOneMeter = it },
