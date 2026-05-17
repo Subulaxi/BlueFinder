@@ -71,7 +71,7 @@ data class CalibrationProfile(
     val txPowerAtOneMeter: Float,
     val points: List<CalibrationPoint>
 )
-enum class CalibrationStep { PREPARE, STEP_1M, STEP_2M, STEP_3M, RESULT }
+enum class CalibrationStep { PREPARE, STEP_0_5M, STEP_1M, STEP_2M, EXTRA_DECISION, EXTRA_INPUT, RESULT }
 
 // --- ViewModel ---
 @SuppressLint("MissingPermission")
@@ -105,6 +105,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     private var latestRssi: Int? = null
     private val deviceLastSeenMap = mutableMapOf<String, Long>()
     private var targetLastSeenAt: Long = 0L
+    private var targetMissedReadCount: Int = 0
     private val _isCalibrating = MutableStateFlow(false)
     val isCalibrating = _isCalibrating.asStateFlow()
 
@@ -158,6 +159,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
         if (_targetDevice.value?.device?.address == address) {
             targetLastSeenAt = System.currentTimeMillis()
+            targetMissedReadCount = 0
             applyRssiFilter(rssi)
         }
     }
@@ -262,6 +264,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         _targetDevice.value = null
+        targetMissedReadCount = 0
         bluetoothAdapter?.cancelDiscovery()
         bluetoothAdapter?.startDiscovery()
     }
@@ -269,7 +272,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     fun isTargetSignalTimedOut(timeoutMs: Long = 4500L): Boolean {
         val target = _targetDevice.value ?: return false
         if (!rawDevicesMap.containsKey(target.device.address)) return true
-        return System.currentTimeMillis() - targetLastSeenAt > timeoutMs
+        return targetMissedReadCount >= 3 || (System.currentTimeMillis() - targetLastSeenAt > timeoutMs)
     }
 
     private fun startPruneLoop() {
@@ -303,6 +306,8 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
                     rssiWindow.add(secondTrimmed)
                     if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
                     _smoothedRssi.value = rssiWindow.average().toInt()
+                } else if (_targetDevice.value != null) {
+                    targetMissedReadCount++
                 }
             }
         }
@@ -681,6 +686,7 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
     var step by remember { mutableStateOf(CalibrationStep.PREPARE) }
     var resultProfile by remember { mutableStateOf<CalibrationProfile?>(null) }
+    var extraDistanceText by remember { mutableStateOf("5") }
     var currentSamples by remember { mutableStateOf(listOf<Int>()) }
     var isRecording by remember { mutableStateOf(false) }
     var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
@@ -713,20 +719,20 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             Spacer(Modifier.height(12.dp))
             Button(
                 enabled = device != null && profileName.isNotBlank(),
-                onClick = { points = emptyList(); step = CalibrationStep.STEP_1M },
+                onClick = { points = emptyList(); step = CalibrationStep.STEP_0_5M },
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
             ) { Text("开始校准引导") }
-        } else if (step == CalibrationStep.STEP_1M || step == CalibrationStep.STEP_2M || step == CalibrationStep.STEP_3M) {
+        } else if (step == CalibrationStep.STEP_0_5M || step == CalibrationStep.STEP_1M || step == CalibrationStep.STEP_2M) {
             val distance = when (step) {
+                CalibrationStep.STEP_0_5M -> 0.5f
                 CalibrationStep.STEP_1M -> 1f
-                CalibrationStep.STEP_2M -> 2f
-                else -> 3f
+                else -> 2f
             }
             val prompt = when (step) {
+                CalibrationStep.STEP_0_5M -> "请将手机放置在距离蓝牙设备 0.5米 的位置"
                 CalibrationStep.STEP_1M -> "请将手机放置在距离蓝牙设备 1米 的位置"
-                CalibrationStep.STEP_2M -> "请移动到距离设备 2米 的位置"
-                else -> "请移动到距离设备 3米 的位置"
+                else -> "请移动到距离设备 2米 的位置"
             }
             Text(prompt, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(14.dp))
@@ -753,18 +759,40 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
                         currentSamples = emptyList()
                         isRecording = false
                         step = when (step) {
+                            CalibrationStep.STEP_0_5M -> CalibrationStep.STEP_1M
                             CalibrationStep.STEP_1M -> CalibrationStep.STEP_2M
-                            CalibrationStep.STEP_2M -> CalibrationStep.STEP_3M
-                            else -> {
-                                resultProfile = viewModel.buildProfileFromPoints(profileName, points + point)
-                                CalibrationStep.RESULT
-                            }
+                            else -> CalibrationStep.EXTRA_DECISION
                         }
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
-            ) { Text("我已放好，记录 ${distance.toInt()} 米数据") }
+            ) { Text("我已放好，记录 ${if (distance < 1f) "0.5" else distance.toInt().toString()} 米数据") }
+        } else if (step == CalibrationStep.EXTRA_DECISION) {
+            Text("基础校准已完成。是否继续进行 5 米或更多距离的增强校准？", color = Color.White)
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { step = CalibrationStep.EXTRA_INPUT }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("继续扩展校准") }
+                Button(onClick = {
+                    resultProfile = viewModel.buildProfileFromPoints(profileName, points)
+                    step = CalibrationStep.RESULT
+                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E))) { Text("直接完成") }
+            }
+        } else if (step == CalibrationStep.EXTRA_INPUT) {
+            Text("请输入扩展距离（米），例如 5 或 8。", color = Color.White)
+            OutlinedTextField(value = extraDistanceText, onValueChange = { extraDistanceText = it }, label = { Text("扩展距离(米)") })
+            Spacer(Modifier.height(10.dp))
+            Button(onClick = {
+                val extraDistance = extraDistanceText.toFloatOrNull()
+                if (extraDistance != null && extraDistance > 2f) {
+                    scope.launch {
+                        val point = viewModel.collectSamplesForDistance(extraDistance, viewModel.calibrationSamplesPerPoint)
+                        points = points + point
+                        resultProfile = viewModel.buildProfileFromPoints(profileName, points)
+                        step = CalibrationStep.RESULT
+                    }
+                }
+            }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("记录扩展距离并完成") }
         } else {
             val profile = resultProfile
             Text("计算完成", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
@@ -984,7 +1012,13 @@ fun FindingScreen(viewModel: BleViewModel) {
             }
             Spacer(modifier = Modifier.height(16.dp))
             val subText = if (isSignalTimeout) "连接超时：未读取到最新信号" else if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
-            Text(text = subText, color = Color.White.copy(alpha = 0.7f), fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.animateContentSize())
+            Text(
+                text = subText,
+                color = if (isSignalTimeout) Color(0xFFFF453A) else Color.White.copy(alpha = 0.7f),
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.animateContentSize()
+            )
         }
         Text(text = "正在寻找: ${device?.name}", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp))
     }
