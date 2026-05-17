@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -19,6 +20,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -30,6 +32,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
@@ -41,6 +44,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -53,14 +57,26 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
 import kotlin.math.pow
 
 // --- 数据模型 ---
 data class BleDevice(val device: BluetoothDevice, var rssi: Int, val name: String)
+data class CalibrationPoint(val distanceMeter: Float, val samples: List<Int>, val averageRssi: Float)
+data class CalibrationProfile(
+    val id: Long,
+    val name: String,
+    val attenuationFactor: Float,
+    val txPowerAtOneMeter: Float,
+    val points: List<CalibrationPoint>
+)
+enum class CalibrationStep { PREPARE, STEP_0_5M, STEP_1M, STEP_2M, EXTRA_DECISION, EXTRA_INPUT, RESULT }
 
 // --- ViewModel ---
 @SuppressLint("MissingPermission")
 class BleViewModel(application: Application) : AndroidViewModel(application) {
+    private val prefs = application.getSharedPreferences("calibration_profiles", Context.MODE_PRIVATE)
 
     private val rawDevicesMap = mutableMapOf<String, BleDevice>()
     val devices: StateFlow<List<BleDevice>> = MutableStateFlow(emptyList())
@@ -73,16 +89,31 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     val smoothedRssi = _smoothedRssi.asStateFlow()
 
     var attenuationFactor by mutableFloatStateOf(4.5f)
+    var txPowerAtOneMeter by mutableFloatStateOf(-59f)
     var closeThreshold by mutableIntStateOf(-35)
     var showDeviceType by mutableStateOf(false)
+    var calibrationProfiles by mutableStateOf(emptyList<CalibrationProfile>())
+    var selectedCalibrationId by mutableStateOf<Long?>(null)
+    var calibrationDistances by mutableStateOf(listOf(1f, 2f, 3f))
+    var calibrationSamplesPerPoint by mutableIntStateOf(8)
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var isScanning = false
-    private val rssiWindow = mutableListOf<Int>()
-    private val WINDOW_SIZE = 5
+    private var latestRssi: Int? = null
+    private val deviceLastSeenMap = mutableMapOf<String, Long>()
+    private var targetLastSeenAt: Long = 0L
+    private var targetMissedReadCount by mutableIntStateOf(0)
+    private val _isCalibrating = MutableStateFlow(false)
+    val isCalibrating = _isCalibrating.asStateFlow()
+
+    init {
+        loadCalibrationProfiles()
+        startRssiRefreshLoop()
+    }
 
     fun initBluetooth(adapter: BluetoothAdapter) {
         bluetoothAdapter = adapter
+        startPruneLoop()
     }
 
     // 🔥 新增：利用 Java 反射黑科技，强制一键取消配对！
@@ -101,6 +132,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleFoundDevice(device: BluetoothDevice, rssi: Int) {
+        latestRssi = rssi
         val rawName = try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) device.alias ?: device.name else device.name
         } catch (e: Exception) { device.name }
@@ -110,6 +142,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
         val address = device.address
         rawDevicesMap[address] = BleDevice(device, rssi, name)
+        deviceLastSeenMap[address] = System.currentTimeMillis()
 
         val currentTime = System.currentTimeMillis()
         if (currentTime - lastSortTime > 2000) {
@@ -122,6 +155,8 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         if (_targetDevice.value?.device?.address == address) {
+            targetLastSeenAt = System.currentTimeMillis()
+            targetMissedReadCount = 0
             applyRssiFilter(rssi)
         }
     }
@@ -172,17 +207,21 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startScan() {
         if (isScanning) return
-        val scanner = bluetoothAdapter?.bluetoothLeScanner
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        scanner?.startScan(null, settings, leScanCallback)
+        try {
+            val scanner = bluetoothAdapter?.bluetoothLeScanner
+            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+            scanner?.startScan(null, settings, leScanCallback)
 
-        val filter = IntentFilter().apply {
-            addAction(BluetoothDevice.ACTION_FOUND)
-            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+            getApplication<Application>().registerReceiver(classicBtReceiver, filter)
+            bluetoothAdapter?.startDiscovery()
+            isScanning = true
+        } catch (_: SecurityException) {
+            isScanning = false
         }
-        getApplication<Application>().registerReceiver(classicBtReceiver, filter)
-        bluetoothAdapter?.startDiscovery()
-        isScanning = true
     }
 
     fun stopScan() {
@@ -209,7 +248,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun selectDevice(device: BleDevice) {
         _targetDevice.value = device
-        rssiWindow.clear()
+        targetLastSeenAt = System.currentTimeMillis()
         applyRssiFilter(device.rssi)
 
         if (device.device.type == BluetoothDevice.DEVICE_TYPE_LE) {
@@ -221,27 +260,188 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun disconnect() {
         _targetDevice.value = null
+        targetMissedReadCount = 0
         bluetoothAdapter?.cancelDiscovery()
         bluetoothAdapter?.startDiscovery()
     }
 
+    fun isTargetSignalTimedOut(): Boolean {
+        val target = _targetDevice.value ?: return false
+        if (!rawDevicesMap.containsKey(target.device.address)) return true
+        return targetMissedReadCount >= 3
+    }
+
+    private fun startPruneLoop() {
+        viewModelScope.launch {
+            while (true) {
+                delay(2000)
+                val now = System.currentTimeMillis()
+                val staleAddresses = deviceLastSeenMap.filterValues { now - it > 7000 }.keys
+                if (staleAddresses.isNotEmpty()) {
+                    staleAddresses.forEach {
+                        rawDevicesMap.remove(it)
+                        deviceLastSeenMap.remove(it)
+                    }
+                    (devices as MutableStateFlow).value = rawDevicesMap.values.toList().sortedByDescending { it.rssi }
+                }
+            }
+        }
+    }
+
     private fun applyRssiFilter(newRssi: Int) {
-        rssiWindow.add(newRssi)
-        if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
-        _smoothedRssi.value = rssiWindow.average().toInt()
+        _smoothedRssi.value = newRssi
+    }
+
+    private fun startRssiRefreshLoop() {
+        viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                if (_targetDevice.value != null && (System.currentTimeMillis() - targetLastSeenAt) > 1000) {
+                    targetMissedReadCount++
+                }
+            }
+        }
+    }
+
+    suspend fun collectSamplesForDistance(distanceMeter: Float, sampleCount: Int): CalibrationPoint {
+        _isCalibrating.value = true
+        val values = mutableListOf<Int>()
+        repeat(sampleCount) {
+            delay(350)
+            latestRssi?.let(values::add)
+        }
+        _isCalibrating.value = false
+        val cleaned = trimExtremes(values)
+        val avg = if (cleaned.isEmpty()) -100f else cleaned.average().toFloat()
+        return CalibrationPoint(distanceMeter, values, avg)
+    }
+
+    private fun trimExtremes(values: List<Int>): List<Int> {
+        if (values.size < 3) return values
+        val sorted = values.sorted()
+        return sorted.subList(1, sorted.size - 1)
+    }
+    fun trimmedAverage(values: List<Int>): Float {
+        val cleaned = trimExtremes(values)
+        return if (cleaned.isEmpty()) -100f else cleaned.average().toFloat()
+    }
+
+    fun buildProfileFromPoints(name: String, points: List<CalibrationPoint>): CalibrationProfile {
+        val regression = fitPathLoss(points)
+        return CalibrationProfile(
+            id = System.currentTimeMillis(),
+            name = name,
+            attenuationFactor = regression.second,
+            txPowerAtOneMeter = regression.first,
+            points = points
+        )
+    }
+
+    private fun fitPathLoss(points: List<CalibrationPoint>): Pair<Float, Float> {
+        val xs = points.map { kotlin.math.log10(it.distanceMeter.toDouble()) }
+        val ys = points.map { it.averageRssi.toDouble() }
+        val xMean = xs.average()
+        val yMean = ys.average()
+        var num = 0.0
+        var den = 0.0
+        xs.indices.forEach { i ->
+            num += (xs[i] - xMean) * (ys[i] - yMean)
+            den += (xs[i] - xMean) * (xs[i] - xMean)
+        }
+        val slope = if (den == 0.0) -40.0 else num / den
+        val intercept = yMean - slope * xMean
+        val n = (-slope / 10.0).coerceIn(1.0, 20.0)
+        return intercept.toFloat() to n.toFloat()
+    }
+
+    fun saveCalibrationProfile(profile: CalibrationProfile) {
+        calibrationProfiles = listOf(profile) + calibrationProfiles
+        persistCalibrationProfiles()
+    }
+    fun deleteCalibrationProfile(profileId: Long) {
+        calibrationProfiles = calibrationProfiles.filterNot { it.id == profileId }
+        if (selectedCalibrationId == profileId) selectedCalibrationId = null
+        persistCalibrationProfiles()
+    }
+
+    fun applyCalibration(profile: CalibrationProfile) {
+        attenuationFactor = profile.attenuationFactor
+        txPowerAtOneMeter = profile.txPowerAtOneMeter
+        selectedCalibrationId = profile.id
+    }
+    fun readCurrentRssi(): Int? = latestRssi
+
+    private fun loadCalibrationProfiles() {
+        val raw = prefs.getString("profiles_json", "[]") ?: "[]"
+        val arr = JSONArray(raw)
+        val loaded = mutableListOf<CalibrationProfile>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.getJSONObject(i)
+            val pointsArray = obj.getJSONArray("points")
+            val points = mutableListOf<CalibrationPoint>()
+            for (j in 0 until pointsArray.length()) {
+                val p = pointsArray.getJSONObject(j)
+                val samplesArray = p.getJSONArray("samples")
+                val samples = mutableListOf<Int>()
+                for (k in 0 until samplesArray.length()) samples.add(samplesArray.getInt(k))
+                points.add(CalibrationPoint(p.getDouble("distance").toFloat(), samples, p.getDouble("avg").toFloat()))
+            }
+            loaded.add(
+                CalibrationProfile(
+                    id = obj.getLong("id"),
+                    name = obj.getString("name"),
+                    attenuationFactor = obj.getDouble("n").toFloat(),
+                    txPowerAtOneMeter = obj.getDouble("tx").toFloat(),
+                    points = points
+                )
+            )
+        }
+        calibrationProfiles = loaded
+    }
+
+    private fun persistCalibrationProfiles() {
+        val arr = JSONArray()
+        calibrationProfiles.forEach { profile ->
+            val points = JSONArray()
+            profile.points.forEach { point ->
+                points.put(
+                    JSONObject()
+                        .put("distance", point.distanceMeter)
+                        .put("avg", point.averageRssi)
+                        .put("samples", JSONArray(point.samples))
+                )
+            }
+            arr.put(
+                JSONObject()
+                    .put("id", profile.id)
+                    .put("name", profile.name)
+                    .put("n", profile.attenuationFactor)
+                    .put("tx", profile.txPowerAtOneMeter)
+                    .put("points", points)
+            )
+        }
+        prefs.edit().putString("profiles_json", arr.toString()).apply()
     }
 }
 
-fun calculateDistance(rssi: Int, n: Float): Double {
-    val txPower = -59.0
-    return 10.0.pow((txPower - rssi) / (10.0 * n))
+fun calculateDistance(rssi: Int, n: Float, txPowerAtOneMeter: Float): Double {
+    return 10.0.pow((txPowerAtOneMeter - rssi) / (10.0 * n))
 }
 
 // --- 页面路由枚举 ---
-enum class AppScreen { SCANNER, FINDING, SETTINGS }
+enum class AppScreen { SCANNER, FINDING, SETTINGS, CALIBRATION_LIST, CALIBRATION_RUN }
 
 // --- MainActivity ---
 class MainActivity : ComponentActivity() {
+    private fun hasScanPermissions(): Boolean {
+        val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION)
+        } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        return requiredPermissions.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -257,7 +457,7 @@ class MainActivity : ComponentActivity() {
 
                 // 🔥 新增：蓝牙开启状态检查与系统一键开启弹窗回调
                 val enableBtLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-                    if (result.resultCode == android.app.Activity.RESULT_OK) {
+                    if (result.resultCode == android.app.Activity.RESULT_OK && hasScanPermissions()) {
                         viewModel.startScan() // 用户点击允许后，立刻开始扫描
                     }
                 }
@@ -265,6 +465,7 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     viewModel.initBluetooth(bluetoothManager.adapter)
                     // 如果蓝牙没开，直接弹出系统底层的“一键开启蓝牙”对话框
+                    if (!hasScanPermissions()) return@LaunchedEffect
                     if (bluetoothManager.adapter != null && !bluetoothManager.adapter.isEnabled) {
                         enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
                     } else {
@@ -272,19 +473,34 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val target = viewModel.targetDevice.collectAsState().value
                 var currentScreen by remember { mutableStateOf(AppScreen.SCANNER) }
-
-                LaunchedEffect(target) {
-                    if (target != null) currentScreen = AppScreen.FINDING
-                    else if (currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
+                val target = viewModel.targetDevice.collectAsState().value
+                LaunchedEffect(target, currentScreen) {
+                    if (target == null && currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
                 }
 
                 Crossfade(targetState = currentScreen, label = "ScreenTransition") { screen ->
                     when (screen) {
-                        AppScreen.SCANNER -> ScannerScreen(viewModel) { currentScreen = AppScreen.SETTINGS }
+                        AppScreen.SCANNER -> ScannerScreen(
+                            viewModel,
+                            onNavigateToSettings = { currentScreen = AppScreen.SETTINGS },
+                            onStartFinding = { currentScreen = AppScreen.FINDING }
+                        )
                         AppScreen.FINDING -> FindingScreen(viewModel)
-                        AppScreen.SETTINGS -> SettingsScreen(viewModel) { currentScreen = AppScreen.SCANNER }
+                        AppScreen.SETTINGS -> SettingsScreen(
+                            viewModel,
+                            onBack = { currentScreen = AppScreen.SCANNER },
+                            onOpenCalibration = { currentScreen = AppScreen.CALIBRATION_LIST }
+                        )
+                        AppScreen.CALIBRATION_LIST -> CalibrationListScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = AppScreen.SETTINGS },
+                            onNewCalibration = { currentScreen = AppScreen.CALIBRATION_RUN }
+                        )
+                        AppScreen.CALIBRATION_RUN -> CalibrationRunScreen(
+                            viewModel = viewModel,
+                            onBack = { currentScreen = AppScreen.CALIBRATION_LIST }
+                        )
                     }
                 }
             }
@@ -296,7 +512,7 @@ class MainActivity : ComponentActivity() {
 @SuppressLint("MissingPermission")
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
-fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
+fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit, onStartFinding: () -> Unit) {
     val devices by viewModel.devices.collectAsState()
     var showDialog by remember { mutableStateOf<BleDevice?>(null) }
     var showUnnamed by remember { mutableStateOf(false) }
@@ -330,12 +546,17 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
                 items(items = filteredDevices, key = { it.device.address }) { device ->
                     DeviceCard(device = device, showType = viewModel.showDeviceType, modifier = Modifier.animateItem()) {
                         val isBonded = device.device.bondState == BluetoothDevice.BOND_BONDED
-                        val isGattConnected = bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+                        val isGattConnected = try {
+                            bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+                        } catch (_: SecurityException) {
+                            false
+                        }
 
                         if (isBonded || isGattConnected) {
                             showDialog = device
                         } else {
                             viewModel.selectDevice(device)
+                            onStartFinding()
                         }
                     }
                 }
@@ -351,6 +572,7 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     viewModel.selectDevice(device)
+                    onStartFinding()
                     showDialog = null
                 }) { Text("🎯 直接查找", color = Color(0xFF0A84FF), fontWeight = FontWeight.Bold) }
             },
@@ -402,15 +624,199 @@ fun DeviceCard(device: BleDevice, showType: Boolean, modifier: Modifier = Modifi
     }
 }
 
+@Composable
+fun BackTitleButton(title: String, onBack: () -> Unit) {
+    TextButton(onClick = onBack) {
+        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回", tint = Color.White)
+        Spacer(Modifier.width(6.dp))
+        Text(title, color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
+@Composable
+fun CalibrationListScreen(viewModel: BleViewModel, onBack: () -> Unit, onNewCalibration: () -> Unit) {
+    BackHandler(onBack = onBack)
+    Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+            BackTitleButton("校准管理", onBack)
+        }
+        Button(onClick = onNewCalibration, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) {
+            Text("进行新校准")
+        }
+        Spacer(Modifier.height(16.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            items(viewModel.calibrationProfiles, key = { it.id }) { profile ->
+                Box(
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E)).padding(14.dp)
+                ) {
+                    Column {
+                        Text(profile.name, color = Color.White, fontWeight = FontWeight.Medium)
+                        Text("n=${"%.2f".format(profile.attenuationFactor)} / Tx=${profile.txPowerAtOneMeter.toInt()} dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { viewModel.applyCalibration(profile) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("应用") }
+                            Button(onClick = { viewModel.deleteCalibrationProfile(profile.id) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF453A))) { Text("删除") }
+                        }
+                    }
+                }
+            }
+        }
+        if (viewModel.calibrationProfiles.isEmpty()) {
+            Text("当前没有历史校准", color = Color.Gray, modifier = Modifier.padding(top = 20.dp))
+        }
+    }
+}
+
+@Composable
+fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+    val scope = rememberCoroutineScope()
+    val device = viewModel.targetDevice.collectAsState().value
+    val devices = viewModel.devices.collectAsState().value
+    var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
+    var step by remember { mutableStateOf(CalibrationStep.PREPARE) }
+    var resultProfile by remember { mutableStateOf<CalibrationProfile?>(null) }
+    var extraDistanceText by remember { mutableStateOf("5") }
+    var currentSamples by remember { mutableStateOf(listOf<Int>()) }
+    var isRecording by remember { mutableStateOf(false) }
+    var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
+
+    Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
+        Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) { BackTitleButton("自动校准", onBack) }
+        if (step == CalibrationStep.PREPARE) {
+            Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(devices, key = { it.device.address }) { d ->
+                    val selected = device?.device?.address == d.device.address
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(if (selected) Color(0xFF34C759) else Color(0xFF1C1C1E))
+                            .clickable { viewModel.selectDevice(d) }
+                            .padding(14.dp)
+                    ) {
+                        Column {
+                            Text(d.name, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+                            Text(d.device.address, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                            Text("${d.rssi} dBm", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+            Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
+            OutlinedTextField(value = profileName, onValueChange = { profileName = it }, label = { Text("校准名称") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(12.dp))
+            Button(
+                enabled = device != null && profileName.isNotBlank(),
+                onClick = { points = emptyList(); step = CalibrationStep.STEP_0_5M },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
+            ) { Text("开始校准引导") }
+        } else if (step == CalibrationStep.STEP_0_5M || step == CalibrationStep.STEP_1M || step == CalibrationStep.STEP_2M) {
+            val distance = when (step) {
+                CalibrationStep.STEP_0_5M -> 0.5f
+                CalibrationStep.STEP_1M -> 1f
+                else -> 2f
+            }
+            val prompt = when (step) {
+                CalibrationStep.STEP_0_5M -> "请将手机放置在距离蓝牙设备 0.5米 的位置"
+                CalibrationStep.STEP_1M -> "请将手机放置在距离蓝牙设备 1米 的位置"
+                else -> "请移动到距离设备 2米 的位置"
+            }
+            Text(prompt, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(14.dp))
+            if (currentSamples.isNotEmpty()) {
+                Text("采样进度：${currentSamples.size}/${viewModel.calibrationSamplesPerPoint}", color = Color(0xFF8E8E93), fontSize = 13.sp)
+                currentSamples.forEachIndexed { index, value ->
+                    Text("第${index + 1}次：$value dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+                }
+            }
+            Spacer(Modifier.weight(1f))
+            Button(
+                enabled = !isRecording,
+                onClick = {
+                    scope.launch {
+                        isRecording = true
+                        currentSamples = emptyList()
+                        repeat(viewModel.calibrationSamplesPerPoint) {
+                            delay(350)
+                            viewModel.readCurrentRssi()?.let { rssi -> currentSamples = currentSamples + rssi }
+                        }
+                        val avg = viewModel.trimmedAverage(currentSamples)
+                        val point = CalibrationPoint(distance, currentSamples, avg)
+                        points = points + point
+                        currentSamples = emptyList()
+                        isRecording = false
+                        step = when (step) {
+                            CalibrationStep.STEP_0_5M -> CalibrationStep.STEP_1M
+                            CalibrationStep.STEP_1M -> CalibrationStep.STEP_2M
+                            else -> CalibrationStep.EXTRA_DECISION
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
+            ) { Text("我已放好，记录 ${if (distance < 1f) "0.5" else distance.toInt().toString()} 米数据") }
+        } else if (step == CalibrationStep.EXTRA_DECISION) {
+            Text("基础校准已完成。是否继续进行 5 米或更多距离的增强校准？", color = Color.White)
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { step = CalibrationStep.EXTRA_INPUT }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("继续扩展校准") }
+                Button(onClick = {
+                    resultProfile = viewModel.buildProfileFromPoints(profileName, points)
+                    step = CalibrationStep.RESULT
+                }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E))) { Text("直接完成") }
+            }
+        } else if (step == CalibrationStep.EXTRA_INPUT) {
+            Text("请输入扩展距离（米），例如 5 或 8。", color = Color.White)
+            OutlinedTextField(value = extraDistanceText, onValueChange = { extraDistanceText = it }, label = { Text("扩展距离(米)") })
+            Spacer(Modifier.height(10.dp))
+            Button(onClick = {
+                val extraDistance = extraDistanceText.toFloatOrNull()
+                if (extraDistance != null && extraDistance > 2f) {
+                    scope.launch {
+                        val point = viewModel.collectSamplesForDistance(extraDistance, viewModel.calibrationSamplesPerPoint)
+                        points = points + point
+                        resultProfile = viewModel.buildProfileFromPoints(profileName, points)
+                        step = CalibrationStep.RESULT
+                    }
+                }
+            }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("记录扩展距离并完成") }
+        } else {
+            val profile = resultProfile
+            Text("计算完成", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            if (profile != null) {
+                Text("衰减因子 n = ${"%.3f".format(profile.attenuationFactor)}", color = Color.White)
+                Text("1米基准值 TxPower = ${"%.1f".format(profile.txPowerAtOneMeter)} dBm", color = Color.White)
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = {
+                        viewModel.saveCalibrationProfile(profile)
+                        viewModel.applyCalibration(profile)
+                        onBack()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34C759))
+                ) { Text("保存并完成") }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        points.forEach { p ->
+            Text("${p.distanceMeter.toInt()}m: 原始${p.samples} -> 均值 ${"%.1f".format(p.averageRssi)} dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+        }
+    }
+}
+
 // --- UI: Settings Page ---
 @Composable
-fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
+fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibration: () -> Unit) {
     BackHandler(onBack = onBack)
 
     Column(modifier = Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = onBack) { Text("← 返回", color = Color.White, fontSize = 18.sp) }
-            Text("设置", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(start = 16.dp))
+            BackTitleButton("设置", onBack)
         }
 
         Text("衰减因子 (n) - 当前: ${String.format("%.1f", viewModel.attenuationFactor)}", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(bottom = 8.dp))
@@ -449,6 +855,20 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             valueRange = 1.0f..20.0f,
             colors = SliderDefaults.colors(thumbColor = Color(0xFF0A84FF), activeTrackColor = Color(0xFF0A84FF))
         )
+        Text("1米强度基准值 (Tx @1m): ${viewModel.txPowerAtOneMeter.toInt()} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 8.dp))
+        Slider(
+            value = viewModel.txPowerAtOneMeter,
+            onValueChange = { viewModel.txPowerAtOneMeter = it },
+            valueRange = -90f..-20f,
+            colors = SliderDefaults.colors(thumbColor = Color(0xFF64D2FF), activeTrackColor = Color(0xFF64D2FF))
+        )
+        Button(
+            onClick = onOpenCalibration,
+            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1C1C1E))
+        ) {
+            Text("进入自动校准", color = Color.White)
+        }
 
         Divider(color = Color.DarkGray, modifier = Modifier.padding(vertical = 16.dp))
 
@@ -488,7 +908,13 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit) {
 
         Text("关于", color = Color.White, fontSize = 18.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(bottom = 12.dp))
         Text("@苏不拉细 / @subulaxi", color = Color.Gray, fontSize = 14.sp, modifier = Modifier.padding(bottom = 8.dp))
-        Text("项目地址:https://github.com/Subulaxi/BlueFinder", color = Color.Gray, fontSize = 14.sp)
+        val uriHandler = LocalUriHandler.current
+        Text(
+            "项目地址: https://github.com/Subulaxi/BlueFinder",
+            color = Color(0xFF0A84FF),
+            fontSize = 14.sp,
+            modifier = Modifier.clickable { uriHandler.openUri("https://github.com/Subulaxi/BlueFinder") }
+        )
     }
 }
 
@@ -501,7 +927,8 @@ fun FindingScreen(viewModel: BleViewModel) {
     val context = LocalContext.current
 
     val isVeryClose = rssi > viewModel.closeThreshold
-    val distance = calculateDistance(rssi, viewModel.attenuationFactor)
+    val distance = calculateDistance(rssi, viewModel.attenuationFactor, viewModel.txPowerAtOneMeter)
+    val isSignalTimeout = viewModel.isTargetSignalTimedOut()
 
     val bgColor by animateColorAsState(
         targetValue = if (isVeryClose) Color(0xFF34C759) else Color(0xFF121212),
@@ -574,8 +1001,14 @@ fun FindingScreen(viewModel: BleViewModel) {
                 }
             }
             Spacer(modifier = Modifier.height(16.dp))
-            val subText = if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
-            Text(text = subText, color = Color.White.copy(alpha = 0.7f), fontSize = 20.sp, fontWeight = FontWeight.Medium, modifier = Modifier.animateContentSize())
+            val subText = if (isSignalTimeout) "连接超时：未读取到最新信号" else if (isVeryClose) "当前信号: $rssi dBm" else "预估距离: 约 ${String.format("%.1f", distance)} 米"
+            Text(
+                text = subText,
+                color = if (isSignalTimeout) Color(0xFFFF453A) else Color.White.copy(alpha = 0.7f),
+                fontSize = 20.sp,
+                fontWeight = FontWeight.Medium,
+                modifier = Modifier.animateContentSize()
+            )
         }
         Text(text = "正在寻找: ${device?.name}", color = Color.White.copy(alpha = 0.5f), fontSize = 14.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 40.dp))
     }
