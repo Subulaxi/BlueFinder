@@ -69,6 +69,7 @@ data class CalibrationProfile(
     val txPowerAtOneMeter: Float,
     val points: List<CalibrationPoint>
 )
+enum class CalibrationStep { PREPARE, STEP_1M, STEP_2M, STEP_3M, RESULT }
 
 // --- ViewModel ---
 @SuppressLint("MissingPermission")
@@ -337,12 +338,18 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         calibrationProfiles = listOf(profile) + calibrationProfiles
         persistCalibrationProfiles()
     }
+    fun deleteCalibrationProfile(profileId: Long) {
+        calibrationProfiles = calibrationProfiles.filterNot { it.id == profileId }
+        if (selectedCalibrationId == profileId) selectedCalibrationId = null
+        persistCalibrationProfiles()
+    }
 
     fun applyCalibration(profile: CalibrationProfile) {
         attenuationFactor = profile.attenuationFactor
         txPowerAtOneMeter = profile.txPowerAtOneMeter
         selectedCalibrationId = profile.id
     }
+    fun readCurrentRssi(): Int? = latestRssi
 
     private fun loadCalibrationProfiles() {
         val raw = prefs.getString("profiles_json", "[]") ?: "[]"
@@ -602,12 +609,16 @@ fun CalibrationListScreen(viewModel: BleViewModel, onBack: () -> Unit, onNewCali
         LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             items(viewModel.calibrationProfiles, key = { it.id }) { profile ->
                 Box(
-                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E))
-                        .clickable { viewModel.applyCalibration(profile) }.padding(14.dp)
+                    Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E)).padding(14.dp)
                 ) {
                     Column {
                         Text(profile.name, color = Color.White, fontWeight = FontWeight.Medium)
                         Text("n=${"%.2f".format(profile.attenuationFactor)} / Tx=${profile.txPowerAtOneMeter.toInt()} dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { viewModel.applyCalibration(profile) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) { Text("应用") }
+                            Button(onClick = { viewModel.deleteCalibrationProfile(profile.id) }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF453A))) { Text("删除") }
+                        }
                     }
                 }
             }
@@ -625,49 +636,91 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     val device = viewModel.targetDevice.collectAsState().value
     val devices = viewModel.devices.collectAsState().value
     var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
-    var running by remember { mutableStateOf(false) }
+    var step by remember { mutableStateOf(CalibrationStep.PREPARE) }
+    var resultProfile by remember { mutableStateOf<CalibrationProfile?>(null) }
     var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
-    val isCalibrating by viewModel.isCalibrating.collectAsState()
 
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) { BackTitleButton("自动校准", onBack) }
-        Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
-        LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(devices, key = { it.device.address }) { d ->
-                val selected = device?.device?.address == d.device.address
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(16.dp))
-                        .background(if (selected) Color(0xFF34C759) else Color(0xFF1C1C1E))
-                        .clickable { viewModel.selectDevice(d) }
-                        .padding(14.dp)
-                ) {
-                    Column {
-                        Text(d.name, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
-                        Text(d.device.address, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
-                        Text("${d.rssi} dBm", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        if (step == CalibrationStep.PREPARE) {
+            Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
+            LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(devices, key = { it.device.address }) { d ->
+                    val selected = device?.device?.address == d.device.address
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .background(if (selected) Color(0xFF34C759) else Color(0xFF1C1C1E))
+                            .clickable { viewModel.selectDevice(d) }
+                            .padding(14.dp)
+                    ) {
+                        Column {
+                            Text(d.name, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+                            Text(d.device.address, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                            Text("${d.rssi} dBm", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }
-        }
-        Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
-        OutlinedTextField(value = profileName, onValueChange = { profileName = it }, label = { Text("校准名称") }, modifier = Modifier.fillMaxWidth())
-        Spacer(Modifier.height(12.dp))
-        Button(enabled = !running && device != null, onClick = {
-            running = true
-            points = emptyList()
-            scope.launch {
-                val collected = mutableListOf<CalibrationPoint>()
-                for (d in viewModel.calibrationDistances) collected += viewModel.collectSamplesForDistance(d, viewModel.calibrationSamplesPerPoint)
-                points = collected
-                val profile = viewModel.buildProfileFromPoints(profileName, points)
-                viewModel.saveCalibrationProfile(profile)
-                viewModel.applyCalibration(profile)
-                running = false
+            Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
+            OutlinedTextField(value = profileName, onValueChange = { profileName = it }, label = { Text("校准名称") }, modifier = Modifier.fillMaxWidth())
+            Spacer(Modifier.height(12.dp))
+            Button(
+                enabled = device != null && profileName.isNotBlank(),
+                onClick = { points = emptyList(); step = CalibrationStep.STEP_1M },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
+            ) { Text("开始校准引导") }
+        } else if (step == CalibrationStep.STEP_1M || step == CalibrationStep.STEP_2M || step == CalibrationStep.STEP_3M) {
+            val distance = when (step) {
+                CalibrationStep.STEP_1M -> 1f
+                CalibrationStep.STEP_2M -> 2f
+                else -> 3f
             }
-        }, modifier = Modifier.fillMaxWidth(), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))) {
-            Text(if (running || isCalibrating) "校准中..." else "开始采样并拟合")
+            val prompt = when (step) {
+                CalibrationStep.STEP_1M -> "请将手机放置在距离蓝牙设备 1米 的位置"
+                CalibrationStep.STEP_2M -> "请移动到距离设备 2米 的位置"
+                else -> "请移动到距离设备 3米 的位置"
+            }
+            Text(prompt, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+            Spacer(Modifier.height(14.dp))
+            Button(
+                onClick = {
+                    scope.launch {
+                        val point = viewModel.collectSamplesForDistance(distance, viewModel.calibrationSamplesPerPoint)
+                        points = points + point
+                        step = when (step) {
+                            CalibrationStep.STEP_1M -> CalibrationStep.STEP_2M
+                            CalibrationStep.STEP_2M -> CalibrationStep.STEP_3M
+                            else -> {
+                                resultProfile = viewModel.buildProfileFromPoints(profileName, points + point)
+                                CalibrationStep.RESULT
+                            }
+                        }
+                    }
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0A84FF))
+            ) { Text("我已放好，记录 ${distance.toInt()} 米数据") }
+        } else {
+            val profile = resultProfile
+            Text("计算完成", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            if (profile != null) {
+                Text("衰减因子 n = ${"%.3f".format(profile.attenuationFactor)}", color = Color.White)
+                Text("1米基准值 TxPower = ${"%.1f".format(profile.txPowerAtOneMeter)} dBm", color = Color.White)
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = {
+                        viewModel.saveCalibrationProfile(profile)
+                        viewModel.applyCalibration(profile)
+                        onBack()
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34C759))
+                ) { Text("保存并完成") }
+            }
         }
         Spacer(Modifier.height(14.dp))
         points.forEach { p ->
