@@ -305,6 +305,10 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
         val sorted = values.sorted()
         return sorted.subList(1, sorted.size - 1)
     }
+    fun trimmedAverage(values: List<Int>): Float {
+        val cleaned = trimExtremes(values)
+        return if (cleaned.isEmpty()) -100f else cleaned.average().toFloat()
+    }
 
     fun buildProfileFromPoints(name: String, points: List<CalibrationPoint>): CalibrationProfile {
         val regression = fitPathLoss(points)
@@ -443,17 +447,19 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val target = viewModel.targetDevice.collectAsState().value
                 var currentScreen by remember { mutableStateOf(AppScreen.SCANNER) }
-
+                val target = viewModel.targetDevice.collectAsState().value
                 LaunchedEffect(target, currentScreen) {
-                    if (target != null && currentScreen == AppScreen.SCANNER) currentScreen = AppScreen.FINDING
-                    else if (currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
+                    if (target == null && currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
                 }
 
                 Crossfade(targetState = currentScreen, label = "ScreenTransition") { screen ->
                     when (screen) {
-                        AppScreen.SCANNER -> ScannerScreen(viewModel) { currentScreen = AppScreen.SETTINGS }
+                        AppScreen.SCANNER -> ScannerScreen(
+                            viewModel,
+                            onNavigateToSettings = { currentScreen = AppScreen.SETTINGS },
+                            onStartFinding = { currentScreen = AppScreen.FINDING }
+                        )
                         AppScreen.FINDING -> FindingScreen(viewModel)
                         AppScreen.SETTINGS -> SettingsScreen(
                             viewModel,
@@ -480,7 +486,7 @@ class MainActivity : ComponentActivity() {
 @SuppressLint("MissingPermission")
 @OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
 @Composable
-fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
+fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit, onStartFinding: () -> Unit) {
     val devices by viewModel.devices.collectAsState()
     var showDialog by remember { mutableStateOf<BleDevice?>(null) }
     var showUnnamed by remember { mutableStateOf(false) }
@@ -520,6 +526,7 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
                             showDialog = device
                         } else {
                             viewModel.selectDevice(device)
+                            onStartFinding()
                         }
                     }
                 }
@@ -535,6 +542,7 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     viewModel.selectDevice(device)
+                    onStartFinding()
                     showDialog = null
                 }) { Text("🎯 直接查找", color = Color(0xFF0A84FF), fontWeight = FontWeight.Bold) }
             },
@@ -638,6 +646,8 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
     var step by remember { mutableStateOf(CalibrationStep.PREPARE) }
     var resultProfile by remember { mutableStateOf<CalibrationProfile?>(null) }
+    var currentSamples by remember { mutableStateOf(listOf<Int>()) }
+    var isRecording by remember { mutableStateOf(false) }
     var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
 
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
@@ -685,11 +695,28 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
             }
             Text(prompt, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
             Spacer(Modifier.height(14.dp))
+            if (currentSamples.isNotEmpty()) {
+                Text("采样进度：${currentSamples.size}/${viewModel.calibrationSamplesPerPoint}", color = Color(0xFF8E8E93), fontSize = 13.sp)
+                currentSamples.forEachIndexed { index, value ->
+                    Text("第${index + 1}次：$value dBm", color = Color(0xFF8E8E93), fontSize = 12.sp)
+                }
+            }
+            Spacer(Modifier.weight(1f))
             Button(
+                enabled = !isRecording,
                 onClick = {
                     scope.launch {
-                        val point = viewModel.collectSamplesForDistance(distance, viewModel.calibrationSamplesPerPoint)
+                        isRecording = true
+                        currentSamples = emptyList()
+                        repeat(viewModel.calibrationSamplesPerPoint) {
+                            delay(350)
+                            viewModel.readCurrentRssi()?.let { rssi -> currentSamples = currentSamples + rssi }
+                        }
+                        val avg = viewModel.trimmedAverage(currentSamples)
+                        val point = CalibrationPoint(distance, currentSamples, avg)
                         points = points + point
+                        currentSamples = emptyList()
+                        isRecording = false
                         step = when (step) {
                             CalibrationStep.STEP_1M -> CalibrationStep.STEP_2M
                             CalibrationStep.STEP_2M -> CalibrationStep.STEP_3M
