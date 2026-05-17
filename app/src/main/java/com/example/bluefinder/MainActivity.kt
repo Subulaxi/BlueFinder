@@ -623,6 +623,7 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
     val scope = rememberCoroutineScope()
     val device = viewModel.targetDevice.collectAsState().value
+    val devices = viewModel.devices.collectAsState().value
     var points by remember { mutableStateOf(listOf<CalibrationPoint>()) }
     var running by remember { mutableStateOf(false) }
     var profileName by remember { mutableStateOf("校准_${System.currentTimeMillis() % 100000}") }
@@ -632,7 +633,7 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) { BackTitleButton("自动校准", onBack) }
         Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
         LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            items(viewModel.devices.collectAsState().value, key = { it.device.address }) { d ->
+            items(devices, key = { it.device.address }) { d ->
                 DeviceCard(device = d, showType = false) { viewModel.selectDevice(d) }
             }
         }
