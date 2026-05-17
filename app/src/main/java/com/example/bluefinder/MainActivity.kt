@@ -687,6 +687,7 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
     Column(Modifier.fillMaxSize().background(Color(0xFF121212)).padding(16.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(top = 40.dp, bottom = 20.dp), verticalAlignment = Alignment.CenterVertically) { BackTitleButton("自动校准", onBack) }
         if (step == CalibrationStep.PREPARE) {
+            Text("提示：自动校准逻辑有待改善，更推荐手动校准。", color = Color(0xFFFF9F0A), fontSize = 12.sp, modifier = Modifier.padding(bottom = 8.dp))
             Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
             LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 items(devices, key = { it.device.address }) { d ->
@@ -862,7 +863,7 @@ fun SettingsScreen(viewModel: BleViewModel, onBack: () -> Unit, onOpenCalibratio
             valueRange = 1.0f..20.0f,
             colors = SliderDefaults.colors(thumbColor = Color(0xFF0A84FF), activeTrackColor = Color(0xFF0A84FF))
         )
-        Text("1米强度基准值 (Tx @1m): ${viewModel.txPowerAtOneMeter.toInt()} dBm", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 8.dp))
+        Text("1米强度基准值 (Tx @1m): ${viewModel.txPowerAtOneMeter.toInt()} dBm（推荐值 -50）", color = Color.White, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp, bottom = 8.dp))
         Slider(
             value = viewModel.txPowerAtOneMeter,
             onValueChange = { viewModel.txPowerAtOneMeter = it },
