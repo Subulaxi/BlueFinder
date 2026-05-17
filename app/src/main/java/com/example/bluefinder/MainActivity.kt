@@ -439,8 +439,8 @@ class MainActivity : ComponentActivity() {
                 val target = viewModel.targetDevice.collectAsState().value
                 var currentScreen by remember { mutableStateOf(AppScreen.SCANNER) }
 
-                LaunchedEffect(target) {
-                    if (target != null) currentScreen = AppScreen.FINDING
+                LaunchedEffect(target, currentScreen) {
+                    if (target != null && currentScreen == AppScreen.SCANNER) currentScreen = AppScreen.FINDING
                     else if (currentScreen == AppScreen.FINDING) currentScreen = AppScreen.SCANNER
                 }
 
@@ -634,7 +634,21 @@ fun CalibrationRunScreen(viewModel: BleViewModel, onBack: () -> Unit) {
         Text("请选择目标设备，并按引导将手机放在 1m / 2m / 3m。", color = Color.Gray, fontSize = 13.sp)
         LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 180.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(devices, key = { it.device.address }) { d ->
-                DeviceCard(device = d, showType = false) { viewModel.selectDevice(d) }
+                val selected = device?.device?.address == d.device.address
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(if (selected) Color(0xFF34C759) else Color(0xFF1C1C1E))
+                        .clickable { viewModel.selectDevice(d) }
+                        .padding(14.dp)
+                ) {
+                    Column {
+                        Text(d.name, color = Color.White, fontSize = 17.sp, fontWeight = FontWeight.Medium)
+                        Text(d.device.address, color = Color.White.copy(alpha = 0.7f), fontSize = 12.sp)
+                        Text("${d.rssi} dBm", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
             }
         }
         Text("当前目标: ${device?.name ?: "未选择"}", color = Color.White, modifier = Modifier.padding(vertical = 8.dp))
