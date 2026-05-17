@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.VibrationEffect
@@ -19,6 +20,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -206,17 +208,21 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startScan() {
         if (isScanning) return
-        val scanner = bluetoothAdapter?.bluetoothLeScanner
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-        scanner?.startScan(null, settings, leScanCallback)
+        try {
+            val scanner = bluetoothAdapter?.bluetoothLeScanner
+            val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
+            scanner?.startScan(null, settings, leScanCallback)
 
-        val filter = IntentFilter().apply {
-            addAction(BluetoothDevice.ACTION_FOUND)
-            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            val filter = IntentFilter().apply {
+                addAction(BluetoothDevice.ACTION_FOUND)
+                addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+            }
+            getApplication<Application>().registerReceiver(classicBtReceiver, filter)
+            bluetoothAdapter?.startDiscovery()
+            isScanning = true
+        } catch (_: SecurityException) {
+            isScanning = false
         }
-        getApplication<Application>().registerReceiver(classicBtReceiver, filter)
-        bluetoothAdapter?.startDiscovery()
-        isScanning = true
     }
 
     fun stopScan() {
@@ -296,7 +302,7 @@ class BleViewModel(application: Application) : AndroidViewModel(application) {
                     rssiSecondBuffer.clear()
                     rssiWindow.add(secondTrimmed)
                     if (rssiWindow.size > WINDOW_SIZE) rssiWindow.removeAt(0)
-                    _smoothedRssi.value = trimmedAverage(rssiWindow).toInt()
+                    _smoothedRssi.value = rssiWindow.average().toInt()
                 }
             }
         }
@@ -432,6 +438,15 @@ enum class AppScreen { SCANNER, FINDING, SETTINGS, CALIBRATION_LIST, CALIBRATION
 
 // --- MainActivity ---
 class MainActivity : ComponentActivity() {
+    private fun hasScanPermissions(): Boolean {
+        val requiredPermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.ACCESS_FINE_LOCATION)
+        } else arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+        return requiredPermissions.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -447,7 +462,7 @@ class MainActivity : ComponentActivity() {
 
                 // 🔥 新增：蓝牙开启状态检查与系统一键开启弹窗回调
                 val enableBtLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-                    if (result.resultCode == android.app.Activity.RESULT_OK) {
+                    if (result.resultCode == android.app.Activity.RESULT_OK && hasScanPermissions()) {
                         viewModel.startScan() // 用户点击允许后，立刻开始扫描
                     }
                 }
@@ -455,6 +470,7 @@ class MainActivity : ComponentActivity() {
                 LaunchedEffect(Unit) {
                     viewModel.initBluetooth(bluetoothManager.adapter)
                     // 如果蓝牙没开，直接弹出系统底层的“一键开启蓝牙”对话框
+                    if (!hasScanPermissions()) return@LaunchedEffect
                     if (bluetoothManager.adapter != null && !bluetoothManager.adapter.isEnabled) {
                         enableBtLauncher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
                     } else {
@@ -535,7 +551,11 @@ fun ScannerScreen(viewModel: BleViewModel, onNavigateToSettings: () -> Unit, onS
                 items(items = filteredDevices, key = { it.device.address }) { device ->
                     DeviceCard(device = device, showType = viewModel.showDeviceType, modifier = Modifier.animateItem()) {
                         val isBonded = device.device.bondState == BluetoothDevice.BOND_BONDED
-                        val isGattConnected = bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+                        val isGattConnected = try {
+                            bluetoothManager.getConnectionState(device.device, BluetoothProfile.GATT) == BluetoothProfile.STATE_CONNECTED
+                        } catch (_: SecurityException) {
+                            false
+                        }
 
                         if (isBonded || isGattConnected) {
                             showDialog = device
